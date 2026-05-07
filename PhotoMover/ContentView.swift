@@ -874,7 +874,7 @@ struct PhotoPreview: View {
         ZoomableImageView(url: photo.url, zoomRequest: zoomRequest)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(8)
-        .padding(.vertical, 8)
+        .padding(.vertical, 0)
     }
 }
 
