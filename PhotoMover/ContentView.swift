@@ -143,6 +143,14 @@ final class PhotoMoverViewModel: ObservableObject {
         currentIndex < photos.count - 1
     }
 
+    var destinationSetButtonTitle: String {
+        savedSets.isEmpty ? "Save Set" : "Create New Set"
+    }
+
+    var canUseDestinationSetButton: Bool {
+        !savedSets.isEmpty || !destinations.isEmpty
+    }
+
     func chooseSourceFolder() {
         guard let folder = pickFolder(title: "Choose Source Folder") else { return }
         startAccessing(folder)
@@ -203,6 +211,26 @@ final class PhotoMoverViewModel: ObservableObject {
         persistSavedSets()
     }
 
+    func createEmptyDestinationSet() {
+        guard let name = promptForSetName(title: "Create New Set", message: "Name this folder set.") else {
+            return
+        }
+
+        let set = DestinationFolderSet(name: name, folderPaths: [], folderBookmarks: [])
+        savedSets.append(set)
+        activeSetID = set.id
+        destinations.removeAll()
+        persistSavedSets()
+    }
+
+    func handleDestinationSetButton() {
+        if savedSets.isEmpty {
+            saveCurrentDestinationsAsSet()
+        } else {
+            createEmptyDestinationSet()
+        }
+    }
+
     func loadDestinationSet(_ set: DestinationFolderSet) {
         activeSetID = set.id
         destinations = set.urls.map { url in
@@ -212,7 +240,13 @@ final class PhotoMoverViewModel: ObservableObject {
     }
 
     func loadDestinationSet(id: DestinationFolderSet.ID?) {
-        guard let id, let set = savedSets.first(where: { $0.id == id }) else { return }
+        guard let id else {
+            activeSetID = nil
+            destinations.removeAll()
+            return
+        }
+
+        guard let set = savedSets.first(where: { $0.id == id }) else { return }
         loadDestinationSet(set)
     }
 
@@ -226,11 +260,25 @@ final class PhotoMoverViewModel: ObservableObject {
     }
 
     func deleteDestinationSet(_ set: DestinationFolderSet) {
+        let deletedActiveSet = activeSetID == set.id
+        let deletedIndex = savedSets.firstIndex(where: { $0.id == set.id })
         savedSets.removeAll { $0.id == set.id }
-        if activeSetID == set.id {
-            activeSetID = nil
+
+        if deletedActiveSet {
+            if let nextSet = nextSetAfterDeletion(from: deletedIndex) {
+                loadDestinationSet(nextSet)
+            } else {
+                activeSetID = nil
+                destinations.removeAll()
+            }
         }
+
         persistSavedSets()
+    }
+
+    func removeDestination(_ destination: DestinationFolder) {
+        destinations.removeAll { $0.id == destination.id }
+        updateActiveSetIfNeeded()
     }
 
     func moveCurrentPhoto(to destination: DestinationFolder) {
@@ -387,6 +435,12 @@ final class PhotoMoverViewModel: ObservableObject {
         persistSavedSets()
     }
 
+    private func nextSetAfterDeletion(from deletedIndex: Int?) -> DestinationFolderSet? {
+        guard !savedSets.isEmpty else { return nil }
+        guard let deletedIndex else { return savedSets.first }
+        return savedSets[min(deletedIndex, savedSets.count - 1)]
+    }
+
     private func destinationPaths() -> [String] {
         destinations.map { $0.url.standardizedFileURL.path }
     }
@@ -532,12 +586,12 @@ struct DestinationSidebar: View {
                             .listRowSeparator(.hidden)
                     } else {
                         ForEach(viewModel.destinations) { destination in
-                            DestinationRow(destination: destination)
+                            DestinationRow(
+                                destination: destination,
+                                moveAction: { viewModel.moveCurrentPhoto(to: destination) },
+                                deleteAction: { viewModel.removeDestination(destination) }
+                            )
                                 .contentShape(Rectangle())
-                                .onTapGesture {
-                                    viewModel.moveCurrentPhoto(to: destination)
-                                }
-                                .disabled(viewModel.currentPhoto == nil)
                         }
                     }
                 }
@@ -556,13 +610,13 @@ struct DestinationSidebar: View {
                 .buttonStyle(.bordered)
 
                 Button {
-                    viewModel.saveCurrentDestinationsAsSet()
+                    viewModel.handleDestinationSetButton()
                 } label: {
-                    Label("Save Set", systemImage: "tray.and.arrow.down")
+                    Label(viewModel.destinationSetButtonTitle, systemImage: viewModel.savedSets.isEmpty ? "tray.and.arrow.down" : "folder.badge.plus")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(viewModel.destinations.isEmpty)
+                .disabled(!viewModel.canUseDestinationSetButton)
             }
             .padding(12)
         }
@@ -603,24 +657,38 @@ struct SavedSetPicker: View {
 
 struct DestinationRow: View {
     let destination: DestinationFolder
+    let moveAction: () -> Void
+    let deleteAction: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "folder")
-                .foregroundStyle(.blue)
-                .frame(width: 18)
+            Button(action: moveAction) {
+                HStack(spacing: 10) {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.blue)
+                        .frame(width: 18)
 
-            Text(destination.name)
-                .lineLimit(1)
+                    Text(destination.name)
+                        .lineLimit(1)
 
-            Spacer()
+                    Spacer()
 
-            Text("\(destination.movedCount)")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(.quaternary, in: Capsule())
+                    Text("\(destination.movedCount)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(.quaternary, in: Capsule())
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.plain)
+
+            Button(role: .destructive, action: deleteAction) {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove destination")
         }
         .padding(.vertical, 6)
     }
