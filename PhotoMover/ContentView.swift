@@ -28,6 +28,46 @@ struct DestinationFolder: Identifiable, Equatable {
     }
 }
 
+struct DestinationFolderSet: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name: String
+    var folderPaths: [String]
+    var folderBookmarks: [String]
+
+    var urls: [URL] {
+        let bookmarkURLs: [URL] = folderBookmarks.compactMap { bookmark in
+            guard let data = Data(base64Encoded: bookmark) else { return nil }
+            var isStale = false
+            return try? URL(
+                resolvingBookmarkData: data,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+        }
+
+        return (bookmarkURLs + folderPaths.map { URL(fileURLWithPath: $0) }).reduce(into: []) { result, url in
+            guard !result.contains(where: { $0.standardizedFileURL == url.standardizedFileURL }) else { return }
+            result.append(url)
+        }
+    }
+
+    init(id: UUID = UUID(), name: String, folderPaths: [String], folderBookmarks: [String]) {
+        self.id = id
+        self.name = name
+        self.folderPaths = folderPaths
+        self.folderBookmarks = folderBookmarks
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try container.decode(String.self, forKey: .name)
+        folderPaths = try container.decodeIfPresent([String].self, forKey: .folderPaths) ?? []
+        folderBookmarks = try container.decodeIfPresent([String].self, forKey: .folderBookmarks) ?? []
+    }
+}
+
 struct MoveRecord {
     let sourceURL: URL
     let destinationURL: URL
@@ -58,6 +98,8 @@ final class PhotoMoverViewModel: ObservableObject {
     @Published var photos: [PhotoItem] = []
     @Published var currentIndex = 0
     @Published var destinations: [DestinationFolder] = []
+    @Published var savedSets: [DestinationFolderSet] = []
+    @Published var activeSetID: DestinationFolderSet.ID?
     @Published var conflict: FileConflict?
     @Published var alertMessage: String?
 
@@ -65,6 +107,11 @@ final class PhotoMoverViewModel: ObservableObject {
     private var accessedFolders: Set<URL> = []
     private let imageExtensions = Set(["jpg", "jpeg", "png", "webp"])
     private let maximumUndoCount = 10
+    private let savedSetsKey = "destinationFolderSets"
+
+    init() {
+        loadSavedSets()
+    }
 
     var currentPhoto: PhotoItem? {
         guard photos.indices.contains(currentIndex) else { return nil }
@@ -88,6 +135,14 @@ final class PhotoMoverViewModel: ObservableObject {
         !moveHistory.isEmpty
     }
 
+    var canGoToPreviousPhoto: Bool {
+        currentIndex > 0
+    }
+
+    var canGoToNextPhoto: Bool {
+        currentIndex < photos.count - 1
+    }
+
     func chooseSourceFolder() {
         guard let folder = pickFolder(title: "Choose Source Folder") else { return }
         startAccessing(folder)
@@ -98,14 +153,84 @@ final class PhotoMoverViewModel: ObservableObject {
     }
 
     func addDestinationFolder() {
-        guard let folder = pickFolder(title: "Choose Destination Folder") else { return }
-        startAccessing(folder)
+        addDestinationFolders()
+    }
 
-        guard !destinations.contains(where: { $0.url.standardizedFileURL == folder.standardizedFileURL }) else {
+    func addDestinationFolders() {
+        let folders = pickFolders(title: "Choose Destination Folders", allowsMultipleSelection: true)
+        guard !folders.isEmpty else { return }
+
+        for folder in folders {
+            startAccessing(folder)
+
+            guard !destinations.contains(where: { $0.url.standardizedFileURL == folder.standardizedFileURL }) else {
+                continue
+            }
+
+            destinations.append(DestinationFolder(url: folder))
+        }
+
+        updateActiveSetIfNeeded()
+    }
+
+    func goToPreviousPhoto() {
+        guard canGoToPreviousPhoto else { return }
+        currentIndex -= 1
+    }
+
+    func goToNextPhoto() {
+        guard canGoToNextPhoto else { return }
+        currentIndex += 1
+    }
+
+    func saveCurrentDestinationsAsSet() {
+        guard !destinations.isEmpty else {
+            alertMessage = "Add destination folders before saving a set."
             return
         }
 
-        destinations.append(DestinationFolder(url: folder))
+        guard let name = promptForSetName(title: "Save Destination Set", message: "Name this folder set.") else {
+            return
+        }
+
+        let set = DestinationFolderSet(
+            name: name,
+            folderPaths: destinationPaths(),
+            folderBookmarks: destinationBookmarks()
+        )
+        savedSets.append(set)
+        activeSetID = set.id
+        persistSavedSets()
+    }
+
+    func loadDestinationSet(_ set: DestinationFolderSet) {
+        activeSetID = set.id
+        destinations = set.urls.map { url in
+            startAccessing(url)
+            return DestinationFolder(url: url)
+        }
+    }
+
+    func loadDestinationSet(id: DestinationFolderSet.ID?) {
+        guard let id, let set = savedSets.first(where: { $0.id == id }) else { return }
+        loadDestinationSet(set)
+    }
+
+    func deleteActiveDestinationSet() {
+        guard let activeSetID,
+              let set = savedSets.first(where: { $0.id == activeSetID }) else {
+            return
+        }
+
+        deleteDestinationSet(set)
+    }
+
+    func deleteDestinationSet(_ set: DestinationFolderSet) {
+        savedSets.removeAll { $0.id == set.id }
+        if activeSetID == set.id {
+            activeSetID = nil
+        }
+        persistSavedSets()
     }
 
     func moveCurrentPhoto(to destination: DestinationFolder) {
@@ -241,16 +366,72 @@ final class PhotoMoverViewModel: ObservableObject {
         }
     }
 
+    private func loadSavedSets() {
+        guard let data = UserDefaults.standard.data(forKey: savedSetsKey) else { return }
+        savedSets = (try? JSONDecoder().decode([DestinationFolderSet].self, from: data)) ?? []
+    }
+
+    private func persistSavedSets() {
+        guard let data = try? JSONEncoder().encode(savedSets) else { return }
+        UserDefaults.standard.set(data, forKey: savedSetsKey)
+    }
+
+    private func updateActiveSetIfNeeded() {
+        guard let activeSetID,
+              let index = savedSets.firstIndex(where: { $0.id == activeSetID }) else {
+            return
+        }
+
+        savedSets[index].folderPaths = destinationPaths()
+        savedSets[index].folderBookmarks = destinationBookmarks()
+        persistSavedSets()
+    }
+
+    private func destinationPaths() -> [String] {
+        destinations.map { $0.url.standardizedFileURL.path }
+    }
+
+    private func destinationBookmarks() -> [String] {
+        destinations.compactMap { destination in
+            try? destination.url.bookmarkData(
+                options: [.withSecurityScope],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            ).base64EncodedString()
+        }
+    }
+
+    private func promptForSetName(title: String, message: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        textField.placeholderString = "Folder set name"
+        alert.accessoryView = textField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+
+        let name = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "Untitled Set" : name
+    }
+
     private func pickFolder(title: String) -> URL? {
+        pickFolders(title: title, allowsMultipleSelection: false).first
+    }
+
+    private func pickFolders(title: String, allowsMultipleSelection: Bool) -> [URL] {
         let panel = NSOpenPanel()
         panel.title = title
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = allowsMultipleSelection
         panel.canCreateDirectories = false
         panel.prompt = "Choose"
 
-        return panel.runModal() == .OK ? panel.url : nil
+        return panel.runModal() == .OK ? panel.urls : []
     }
 
     private func startAccessing(_ folder: URL) {
@@ -337,32 +518,86 @@ struct DestinationSidebar: View {
 
             Divider()
 
-            if viewModel.destinations.isEmpty {
-                EmptyDestinationView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List(viewModel.destinations) { destination in
-                    DestinationRow(destination: destination)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            viewModel.moveCurrentPhoto(to: destination)
-                        }
-                        .disabled(viewModel.currentPhoto == nil)
-                }
-                .listStyle(.sidebar)
-            }
+            SavedSetPicker(viewModel: viewModel)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
 
             Divider()
 
-            Button {
-                viewModel.addDestinationFolder()
-            } label: {
-                Label("Add Destination", systemImage: "folder.badge.plus")
-                    .frame(maxWidth: .infinity)
+            List {
+                Section("Folders") {
+                    if viewModel.destinations.isEmpty {
+                        EmptyDestinationView()
+                            .frame(maxWidth: .infinity)
+                            .listRowSeparator(.hidden)
+                    } else {
+                        ForEach(viewModel.destinations) { destination in
+                            DestinationRow(destination: destination)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    viewModel.moveCurrentPhoto(to: destination)
+                                }
+                                .disabled(viewModel.currentPhoto == nil)
+                        }
+                    }
+                }
             }
-            .buttonStyle(.bordered)
+            .listStyle(.sidebar)
+
+            Divider()
+
+            VStack(spacing: 8) {
+                Button {
+                    viewModel.addDestinationFolders()
+                } label: {
+                    Label("Add Destinations", systemImage: "folder.badge.plus")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+
+                Button {
+                    viewModel.saveCurrentDestinationsAsSet()
+                } label: {
+                    Label("Save Set", systemImage: "tray.and.arrow.down")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.destinations.isEmpty)
+            }
             .padding(12)
         }
+    }
+}
+
+struct SavedSetPicker: View {
+    @ObservedObject var viewModel: PhotoMoverViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Picker("Saved Sets", selection: activeSetBinding) {
+                Text("No saved set").tag(Optional<DestinationFolderSet.ID>.none)
+                ForEach(viewModel.savedSets) { set in
+                    Text(set.name).tag(Optional(set.id))
+                }
+            }
+            .labelsHidden()
+            .disabled(viewModel.savedSets.isEmpty)
+
+            Button(role: .destructive) {
+                viewModel.deleteActiveDestinationSet()
+            } label: {
+                Image(systemName: "trash")
+            }
+            .disabled(viewModel.activeSetID == nil)
+            .help("Delete set")
+        }
+    }
+
+    private var activeSetBinding: Binding<DestinationFolderSet.ID?> {
+        Binding(
+            get: { viewModel.activeSetID },
+            set: { viewModel.loadDestinationSet(id: $0) }
+        )
     }
 }
 
@@ -410,6 +645,7 @@ struct EmptyDestinationView: View {
 
 struct MainPhotoView: View {
     @ObservedObject var viewModel: PhotoMoverViewModel
+    @State private var zoomRequest: ZoomRequest?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -420,7 +656,7 @@ struct MainPhotoView: View {
                 if viewModel.sourceFolder == nil {
                     SourceEmptyState(viewModel: viewModel)
                 } else if let photo = viewModel.currentPhoto {
-                    PhotoPreview(photo: photo, positionText: viewModel.positionText)
+                    PhotoPreview(photo: photo, zoomRequest: zoomRequest)
                 } else {
                     DoneState(viewModel: viewModel)
                 }
@@ -446,6 +682,13 @@ struct MainPhotoView: View {
 
             Spacer()
 
+            Text(viewModel.positionText)
+                .font(.headline)
+                .foregroundStyle(.secondary)
+                .opacity(viewModel.currentPhoto == nil ? 0 : 1)
+
+            Spacer()
+
             Button {
                 viewModel.chooseSourceFolder()
             } label: {
@@ -464,6 +707,40 @@ struct MainPhotoView: View {
                 Label("Undo", systemImage: "arrow.uturn.backward")
             }
             .disabled(!viewModel.canUndo)
+
+            Button {
+                viewModel.goToPreviousPhoto()
+            } label: {
+                Label("Previous", systemImage: "chevron.left")
+            }
+            .disabled(!viewModel.canGoToPreviousPhoto)
+
+            Button {
+                viewModel.goToNextPhoto()
+            } label: {
+                Label("Skip", systemImage: "chevron.right")
+            }
+            .disabled(!viewModel.canGoToNextPhoto)
+
+            Spacer()
+
+            HStack(spacing: 6) {
+                Button {
+                    zoomRequest = ZoomRequest(scale: 0.8)
+                } label: {
+                    Image(systemName: "minus.magnifyingglass")
+                }
+                .help("Zoom out")
+                .disabled(viewModel.currentPhoto == nil)
+
+                Button {
+                    zoomRequest = ZoomRequest(scale: 1.25)
+                } label: {
+                    Image(systemName: "plus.magnifyingglass")
+                }
+                .help("Zoom in")
+                .disabled(viewModel.currentPhoto == nil)
+            }
 
             Spacer()
 
@@ -516,29 +793,174 @@ struct DoneState: View {
     }
 }
 
+struct ZoomRequest: Equatable {
+    let id = UUID()
+    let scale: CGFloat
+}
+
 struct PhotoPreview: View {
     let photo: PhotoItem
-    let positionText: String
+    let zoomRequest: ZoomRequest?
 
     var body: some View {
-        VStack(spacing: 14) {
-            Text(positionText)
-                .font(.headline)
-                .foregroundStyle(.secondary)
-
-            Image(nsImage: NSImage(contentsOf: photo.url) ?? NSImage())
-                .resizable()
-                .scaledToFit()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(24)
-
-            Text(photo.filename)
-                .font(.callout.weight(.medium))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .padding(.horizontal, 24)
-        }
+        ZoomableImageView(url: photo.url, zoomRequest: zoomRequest)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(24)
         .padding(.vertical, 18)
+    }
+}
+
+struct ZoomableImageView: NSViewRepresentable {
+    let url: URL
+    let zoomRequest: ZoomRequest?
+
+    func makeNSView(context: Context) -> ZoomableImageScrollView {
+        let scrollView = ZoomableImageScrollView()
+        scrollView.loadImage(from: url)
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: ZoomableImageScrollView, context: Context) {
+        nsView.loadImage(from: url)
+
+        if let zoomRequest, context.coordinator.lastZoomRequestID != zoomRequest.id {
+            context.coordinator.lastZoomRequestID = zoomRequest.id
+            nsView.zoom(by: zoomRequest.scale)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    final class Coordinator {
+        var lastZoomRequestID: UUID?
+    }
+}
+
+final class ZoomableImageScrollView: NSScrollView {
+    private let canvasView = NSView()
+    private let imageView = NSImageView()
+    private var loadedURL: URL?
+    private var zoom: CGFloat = 1
+    private var gestureStartZoom: CGFloat = 1
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        drawsBackground = false
+        hasVerticalScroller = true
+        hasHorizontalScroller = true
+        autohidesScrollers = true
+        usesPredominantAxisScrolling = false
+        borderType = .noBorder
+
+        imageView.imageScaling = .scaleAxesIndependently
+        imageView.imageAlignment = .alignCenter
+        imageView.wantsLayer = true
+        canvasView.addSubview(imageView)
+        documentView = canvasView
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        updateDocumentFrame()
+    }
+
+    func loadImage(from url: URL) {
+        guard loadedURL != url else { return }
+        loadedURL = url
+        imageView.image = NSImage(contentsOf: url)
+        zoom = 1
+        gestureStartZoom = 1
+        updateDocumentFrame()
+    }
+
+    override func magnify(with event: NSEvent) {
+        if event.phase == .began {
+            gestureStartZoom = zoom
+        }
+
+        let nextZoom = gestureStartZoom * (1 + event.magnification)
+        setZoom(nextZoom, centeredAt: convert(event.locationInWindow, from: nil))
+
+        if event.phase == .ended || event.phase == .cancelled {
+            gestureStartZoom = zoom
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard event.modifierFlags.contains(.option) || event.modifierFlags.contains(.command) else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        setZoom(zoom * (1 - event.scrollingDeltaY / 300), centeredAt: convert(event.locationInWindow, from: nil))
+    }
+
+    func zoom(by scale: CGFloat) {
+        let centerPoint = NSPoint(x: bounds.midX, y: bounds.midY)
+        setZoom(zoom * scale, centeredAt: centerPoint)
+    }
+
+    private func setZoom(_ nextZoom: CGFloat, centeredAt pointInScrollView: NSPoint) {
+        guard let documentView else { return }
+
+        let oldVisibleRect = contentView.bounds
+        let anchorInDocument = convert(pointInScrollView, to: documentView)
+        let oldSize = documentView.bounds.size
+
+        zoom = min(max(nextZoom, 0.2), 8)
+        updateDocumentFrame()
+
+        let newSize = documentView.bounds.size
+        let scaleX = oldSize.width > 0 ? newSize.width / oldSize.width : 1
+        let scaleY = oldSize.height > 0 ? newSize.height / oldSize.height : 1
+        let viewportPoint = convert(pointInScrollView, to: contentView)
+        let newOrigin = NSPoint(
+            x: anchorInDocument.x * scaleX - viewportPoint.x,
+            y: anchorInDocument.y * scaleY - viewportPoint.y
+        )
+
+        contentView.scroll(to: boundedScrollOrigin(newOrigin, visibleSize: oldVisibleRect.size, documentSize: newSize))
+        reflectScrolledClipView(contentView)
+    }
+
+    private func updateDocumentFrame() {
+        guard let image = imageView.image else {
+            canvasView.frame = bounds
+            imageView.frame = bounds
+            return
+        }
+
+        let viewportSize = contentView.bounds.size
+        guard image.size.width > 0, image.size.height > 0, viewportSize.width > 0, viewportSize.height > 0 else {
+            return
+        }
+
+        let fitScale = min(viewportSize.width / image.size.width, viewportSize.height / image.size.height)
+        let imageWidth = image.size.width * fitScale * zoom
+        let imageHeight = image.size.height * fitScale * zoom
+        let canvasWidth = max(viewportSize.width, imageWidth)
+        let canvasHeight = max(viewportSize.height, imageHeight)
+
+        canvasView.frame = NSRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight)
+        imageView.frame = NSRect(
+            x: (canvasWidth - imageWidth) / 2,
+            y: (canvasHeight - imageHeight) / 2,
+            width: imageWidth,
+            height: imageHeight
+        )
+    }
+
+    private func boundedScrollOrigin(_ origin: NSPoint, visibleSize: NSSize, documentSize: NSSize) -> NSPoint {
+        NSPoint(
+            x: min(max(origin.x, 0), max(documentSize.width - visibleSize.width, 0)),
+            y: min(max(origin.y, 0), max(documentSize.height - visibleSize.height, 0))
+        )
     }
 }
 
